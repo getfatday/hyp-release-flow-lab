@@ -58,4 +58,8 @@ time) runs `scripts/release.py`:
    consumed files, commits `release: v<version>`, pushes, creates the annotated tag and
    the GitHub release
 
-Re-running on a tree with nothing pending is a no-op, and a tag is never created twice.
+The job always works on the current tip of main, and changesets merged while a release
+run is in flight are batched into that release: a push rejected as non-fast-forward makes
+the job discard its local release commit, re-read main, and recompute (the tag is only
+ever created after main was pushed). Re-running on a tree with nothing pending is a
+no-op, and a tag is never created twice.

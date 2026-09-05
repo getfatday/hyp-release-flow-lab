@@ -15,17 +15,38 @@ Runs on every push to main (see .github/workflows/release.yml) and turns pending
   3. write the new version into plugin.json (only the version value changes), prepend a
      "## <version> (<UTC date>)" section to CHANGELOG.md grouped Breaking / Added / Fixed,
      delete the consumed files, commit "release: v<version>", tag v<version> (annotated)
-  4. with --publish: push main, push the tag, `gh release create --verify-tag` with the
-     new section as notes (skipped with a notice when no GH_TOKEN / GITHUB_TOKEN is set)
+  4. with --publish: the job works on the CURRENT tip of main, not the sha that
+     triggered it. It first runs `git fetch origin main` + `git reset --hard origin/main`
+     (both shas are printed), then computes, commits the release, and pushes
+     `HEAD:main`. Only after that push succeeded does it create the annotated tag, push
+     the tag, and run `gh release create --verify-tag` with the new section as notes
+     (skipped with a notice when no GH_TOKEN / GITHUB_TOKEN is set). A tag is never
+     created before the main push succeeded.
+
+     Push race: when `git push origin HEAD:main` is rejected as non-fast-forward
+     (another changeset landed while this run was computing), the local release commit
+     is discarded (fresh fetch, reset --hard origin/main) and the whole computation is
+     retried, at most 3 attempts in total, so changesets merged during the run are
+     batched into the one release with the higher bump. Three consecutive rejections
+     exit 3 with nothing tagged.
+
+Without --publish (local / selftest mode) nothing talks to a remote: the release is
+committed and then tagged, in that order.
 
 Idempotent: a tree with no pending files is a no-op; the tag is never created twice
 (an existing v<next> tag aborts before anything is written); a release commit whose tag
-or publish step failed is resumed on the next run instead of being re-cut.
+or publish step failed is resumed on the next run instead of being re-cut (in publish
+mode the release commit is already origin/main, so only the tag and the GitHub release
+are created).
 
 Exit codes: 0 ok / no-op, 1 changeset parse failure, 2 version or tag drift, 3 git or gh
-command failure.
+command failure (including a main push still rejected after 3 attempts).
 
-Usage: python3 scripts/release.py [--repo PATH] [--publish]
+Usage: python3 scripts/release.py [--repo PATH] [--publish] [--test-inject-commit CMD]
+  --test-inject-commit CMD  selftest only: shell command run once, in the repo, after the
+                            release commit exists and before the first `git push`; the
+                            selftest uses it to land a commit on origin mid-run and prove
+                            the race is batched.
 Python 3.9 compatible.
 """
 import argparse
@@ -238,11 +259,51 @@ def changelog_section(repo, version):
     return "".join(out).rstrip("\n") + "\n" if out else None
 
 
-def publish(repo, version, notes, push_main):
+
+
+MAX_ATTEMPTS = 3
+REJECTED_RE = re.compile(r"!\s+\[rejected\]")
+
+
+class PushRejected(Exception):
+    """origin refused HEAD:main as non-fast-forward; the tip moved under us."""
+
+
+def push_main(repo):
+    """Push HEAD to origin main. Raises PushRejected on a non-fast-forward rejection,
+    dies (exit 3) on any other failure."""
+    res = git(repo, "push", "origin", "HEAD:main", check=False)
+    if res.returncode == 0:
+        print("release: pushed main (%s)" % git(repo, "rev-parse", "--short", "HEAD").stdout.strip())
+        sys.stdout.flush()
+        return
+    err = (res.stderr or "").strip()
+    if REJECTED_RE.search(err) and "remote rejected" not in err:
+        raise PushRejected(err)
+    die(3, "git push origin HEAD:main failed (exit %d):\n%s" % (res.returncode, err))
+
+
+def sync_to_origin_main(repo, why):
+    """git fetch origin main + git reset --hard origin/main; prints both shas."""
+    local = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "fetch", "-q", "origin", "main")
+    remote = git(repo, "rev-parse", "FETCH_HEAD").stdout.strip()
+    git(repo, "reset", "-q", "--hard", remote)
+    print("release: %s: local HEAD was %s, origin/main is %s; working on origin/main"
+          % (why, local[:12], remote[:12]))
+    sys.stdout.flush()
+    return local, remote
+
+
+def create_tag(repo, version):
     tag = "v" + version
-    if push_main:
-        git(repo, "push", "origin", "HEAD:main")
-        print("release: pushed main")
+    git(repo, "tag", "-a", tag, "-m", "release: " + tag)
+    print("release: tagged %s" % tag)
+
+
+def publish_tag_and_release(repo, version, notes):
+    """Push the (already created) tag and create the GitHub release. Idempotent."""
+    tag = "v" + version
     if not remote_has_tag(repo, tag):
         git(repo, "push", "origin", "refs/tags/" + tag)
         print("release: pushed tag %s" % tag)
@@ -269,17 +330,30 @@ def publish(repo, version, notes, push_main):
     print("release: created GitHub release %s" % tag)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--repo", default=".", help="plugin repository root (default: .)")
-    ap.add_argument("--publish", action="store_true",
-                    help="push main and the tag to origin and create the GitHub release")
-    args = ap.parse_args(argv)
-    repo = os.path.abspath(args.repo)
+class Injector(object):
+    """--test-inject-commit: run the command once, right before the first push."""
 
-    if git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        die(2, "the working tree has uncommitted changes; release.py only runs on a clean tree")
+    def __init__(self, cmd):
+        self.cmd = cmd
+        self.fired = False
 
+    def fire(self, repo):
+        if not self.cmd or self.fired:
+            return
+        self.fired = True
+        print("release: [test] running --test-inject-commit before the push")
+        sys.stdout.flush()
+        res = subprocess.run(self.cmd, shell=True, cwd=repo, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            die(3, "--test-inject-commit command failed (exit %d):\n%s"
+                % (res.returncode, (res.stderr or "").strip()))
+
+
+def attempt_release(repo, publish_mode, injector):
+    """One full computation on the current HEAD. Returns the exit code, or raises
+    PushRejected when the main push lost a race (the caller resyncs and retries).
+    In publish mode no tag exists until push_main() has returned."""
     plugin_text, plugin_version = read_plugin_version(repo)
     base_tag = baseline_tag(repo)
     if base_tag is None:
@@ -293,13 +367,13 @@ def main(argv=None):
     if baseline != plugin_version:
         if resumed == plugin_version and not tag_exists(repo, "v" + plugin_version) \
                 and semver_key("v" + plugin_version) > semver_key(base_tag):
-            # A release commit landed but its tag never did: finish that release.
+            # A release commit landed (in publish mode it is already origin/main) but its
+            # tag never did: finish that release without re-cutting it.
             print("release: HEAD is 'release: v%s' without its tag; resuming" % plugin_version)
-            git(repo, "tag", "-a", "v" + plugin_version, "-m", "release: v" + plugin_version)
-            print("release: tagged v%s" % plugin_version)
-            if args.publish:
+            create_tag(repo, plugin_version)
+            if publish_mode:
                 notes = changelog_section(repo, plugin_version) or ("release v" + plugin_version)
-                publish(repo, plugin_version, notes, push_main=True)
+                publish_tag_and_release(repo, plugin_version, notes)
             return 0
         die(2, "version drift: %s says \"version\": \"%s\" but the highest release tag reachable "
                "from HEAD is %s. Only scripts/release.py writes the version; a pull request must "
@@ -310,10 +384,10 @@ def main(argv=None):
     if not pending:
         print("release: no pending changesets under %s/ (baseline %s); nothing to do"
               % (CHANGESET_DIR, base_tag))
-        if args.publish and resumed == baseline and not remote_has_tag(repo, base_tag):
+        if publish_mode and resumed == baseline and not remote_has_tag(repo, base_tag):
             print("release: tag %s exists locally but not on origin; resuming publish" % base_tag)
             notes = changelog_section(repo, baseline) or ("release " + base_tag)
-            publish(repo, baseline, notes, push_main=False)
+            publish_tag_and_release(repo, baseline, notes)
         return 0
 
     print("release: baseline %s, %d pending changeset(s): %s"
@@ -325,9 +399,9 @@ def main(argv=None):
             git(repo, "rm", "-q", os.path.join(CHANGESET_DIR, n))
         git(repo, "commit", "-q", "-m", "chore: consume no-op changesets")
         print("release: consumed %d no-op changeset(s), committed, no tag" % len(pending))
-        if args.publish:
-            git(repo, "push", "origin", "HEAD:main")
-            print("release: pushed main")
+        if publish_mode:
+            injector.fire(repo)
+            push_main(repo)
         return 0
 
     next_version = bump_version(baseline, highest)
@@ -335,7 +409,7 @@ def main(argv=None):
     if tag_exists(repo, next_tag):
         die(2, "tag %s already exists but is not reachable from HEAD (baseline is %s). Refusing "
                "to create a second %s; inspect the tag before re-running." % (next_tag, base_tag, next_tag))
-    if args.publish and remote_has_tag(repo, next_tag):
+    if publish_mode and remote_has_tag(repo, next_tag):
         die(2, "tag %s already exists on origin; fetch tags (git fetch --tags) and inspect before "
                "re-running." % next_tag)
 
@@ -350,15 +424,51 @@ def main(argv=None):
     git(repo, "add", PLUGIN_JSON, CHANGELOG)
     git(repo, "commit", "-q", "-m", "release: " + next_tag)
     print("release: committed release: %s (%s bump from %s)" % (next_tag, highest, base_tag))
-    if args.publish:
-        git(repo, "push", "origin", "HEAD:main")
-        print("release: pushed main")
-    git(repo, "tag", "-a", next_tag, "-m", "release: " + next_tag)
-    print("release: tagged %s" % next_tag)
-    if args.publish:
-        publish(repo, next_version, section, push_main=False)
+    if publish_mode:
+        injector.fire(repo)
+        push_main(repo)  # raises PushRejected on a lost race: no tag has been created
+    create_tag(repo, next_version)
+    if publish_mode:
+        publish_tag_and_release(repo, next_version, section)
     sys.stdout.write(section)
     return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--repo", default=".", help="plugin repository root (default: .)")
+    ap.add_argument("--publish", action="store_true",
+                    help="work on the current origin/main, push main, then tag and create the "
+                         "GitHub release")
+    ap.add_argument("--test-inject-commit", metavar="CMD", default=None,
+                    help="selftest only: shell command run once after the release commit and "
+                         "before the first push (simulates a commit landing on origin mid-run)")
+    args = ap.parse_args(argv)
+    repo = os.path.abspath(args.repo)
+
+    if git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        die(2, "the working tree has uncommitted changes; release.py only runs on a clean tree")
+
+    injector = Injector(args.test_inject_commit)
+    if not args.publish:
+        return attempt_release(repo, False, injector)
+
+    sync_to_origin_main(repo, "publish: syncing to the current tip of main")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return attempt_release(repo, True, injector)
+        except PushRejected as exc:
+            print("release: push of main rejected as non-fast-forward on attempt %d/%d (the tip "
+                  "moved while this run computed); discarding the local release commit"
+                  % (attempt, MAX_ATTEMPTS))
+            sys.stdout.flush()
+            sync_to_origin_main(repo, "discarding the local release commit")
+            if attempt == MAX_ATTEMPTS:
+                die(3, "git push origin HEAD:main was rejected %d times in a row; nothing was "
+                       "tagged. Re-run the job (or push to main again) to release the batch.\n%s"
+                    % (MAX_ATTEMPTS, str(exc)))
+            print("release: recomputing so the changesets that just landed join this release")
+    return 3
 
 
 if __name__ == "__main__":

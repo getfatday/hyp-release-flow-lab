@@ -12,6 +12,14 @@ scripts/changeset-check.py from the tree this file lives in through:
                  CHANGELOG ordering (newest first, existing content kept, filename after each
                  body), idempotence (second run is a no-op), annotated tag exists after a run
                  (local tag; --publish is not used, there is no remote)
+  --publish      against a local bare "origin": (a) happy path pushes main, then creates
+                 and pushes the tag, tag points at origin/main; (b) push race via
+                 --test-inject-commit (a second changeset lands on origin between compute
+                 and push): first push rejected, retry batches both changesets into ONE
+                 release with the higher bump, exactly one tag, on the pushed commit;
+                 (c) a push that fails outright (pre-receive hook) leaves no tag anywhere;
+                 the job syncs to origin/main first (a stale local checkout is discarded);
+                 resume when the release commit is on origin but the tag is missing
   changeset-check  missing changeset -> 1, bad frontmatter -> 1, unknown bump -> 1,
                  version edit -> 1, CHANGELOG edit -> 1, valid -> 0, none without body -> 0
 
@@ -258,6 +266,140 @@ def test_resume_after_partial_failure(root):
           and git(repo, "log", "--format=%s").count("release:") == 1)
 
 
+# ------------------------------------------------------------------ --publish + origin
+
+def make_origin(root, name, version="0.3.3"):
+    """A working clone `name` with a bare `name-origin.git` as origin; main + tags pushed."""
+    repo = make_repo(root, name, version)
+    bare = os.path.join(root, name + "-origin.git")
+    git(root, "init", "-q", "--bare", "-b", "main", bare)
+    git(repo, "remote", "add", "origin", bare)
+    git(repo, "push", "-q", "origin", "main", "--tags")
+    return repo, bare
+
+
+def clone(root, bare, name):
+    path = os.path.join(root, name)
+    git(root, "clone", "-q", bare, path)
+    return path
+
+
+def origin_tags(bare):
+    return sorted(git(bare, "tag").split())
+
+
+def origin_head(bare):
+    return git(bare, "rev-parse", "main").strip()
+
+
+def tag_target(repo, tag):
+    """Commit a (possibly annotated) tag points at."""
+    return git(repo, "rev-list", "-n", "1", tag).strip()
+
+
+def test_publish_happy_path(root):
+    repo, bare = make_origin(root, "pub-happy")
+    add_changeset(repo, "H-7", "patch", "a pushed fix.")
+    git(repo, "push", "-q", "origin", "main")
+    res = release(repo, "--publish")
+    check("publish: happy path exits 0", res.returncode == 0, res.stderr.strip())
+    head = git(repo, "rev-parse", "HEAD").strip()
+    check("publish: origin/main is the release commit",
+          origin_head(bare) == head and git(bare, "log", "-1", "--format=%s", "main").strip() == "release: v0.3.4")
+    check("publish: tag v0.3.4 on origin", "v0.3.4" in origin_tags(bare), origin_tags(bare))
+    check("publish: origin tag points at origin/main", tag_target(bare, "v0.3.4") == origin_head(bare))
+    out = res.stdout
+    check("publish: main pushed BEFORE the tag was created",
+          0 < out.find("pushed main") < out.find("tagged v0.3.4") < out.find("pushed tag v0.3.4"), out)
+    check("publish: sync step printed both shas", "syncing to the current tip of main" in out and "origin/main is" in out, out)
+    check("publish: GH_TOKEN absent -> gh step skipped with notice", "GH_TOKEN not set" in out, out)
+    check("publish: changeset consumed on origin",
+          run(["git", "cat-file", "-e", "main:.changeset/H-7.md"], bare).returncode != 0)
+    # idempotent second publish run: nothing to do, no new tag
+    res2 = release(repo, "--publish")
+    check("publish: second run is a no-op", res2.returncode == 0 and "nothing to do" in res2.stdout
+          and origin_tags(bare) == ["v0.3.3", "v0.3.4"], (res2.stdout, origin_tags(bare)))
+
+
+def test_publish_stale_checkout(root):
+    # the job's checkout is behind origin (the triggering sha): it must release the tip
+    repo, bare = make_origin(root, "pub-stale")
+    other = clone(root, bare, "pub-stale-other")
+    add_changeset(other, "H-8-late", "minor", "landed after the trigger.")
+    git(other, "push", "-q", "origin", "HEAD:main")
+    stale = git(repo, "rev-parse", "HEAD").strip()
+    res = release(repo, "--publish")
+    check("publish: stale checkout is discarded, tip of main is released",
+          res.returncode == 0 and plugin_version(repo) == "0.4.0" and stale != origin_head(bare)
+          and "H-8-late.md" in read(repo, "CHANGELOG.md"), (res.returncode, res.stderr.strip(), plugin_version(repo)))
+    check("publish: sync message names the stale local sha", stale[:12] in res.stdout, res.stdout)
+
+
+def test_publish_race(root):
+    repo, bare = make_origin(root, "pub-race")
+    add_changeset(repo, "H-9-fix", "patch", "the first fix.")
+    git(repo, "push", "-q", "origin", "main")
+    # a second PR merges to origin while release.py has already computed the patch release
+    other = clone(root, bare, "pub-race-other")
+    add_changeset(other, "H-10-feature", "minor", "the feature that landed mid-run.")
+    inject = "git -C %s push -q origin HEAD:main" % other
+    res = release(repo, "--publish", "--test-inject-commit", inject)
+    check("race: exits 0", res.returncode == 0, res.stderr.strip())
+    out = res.stdout
+    check("race: first push rejected, retried", "rejected as non-fast-forward on attempt 1/3" in out, out)
+    check("race: inject fired exactly once", out.count("running --test-inject-commit") == 1, out)
+    subjects = git(bare, "log", "--format=%s", "main")
+    check("race: exactly ONE release commit on origin, version 0.4.0 (higher bump wins)",
+          subjects.count("release: v0.4.0") == 1 and "release: v0.3.4" not in subjects
+          and plugin_version(repo) == "0.4.0", subjects)
+    check("race: exactly one new tag, v0.4.0, no v0.3.4 anywhere",
+          origin_tags(bare) == ["v0.3.3", "v0.4.0"] and sorted(git(repo, "tag").split()) == ["v0.3.3", "v0.4.0"],
+          (origin_tags(bare), git(repo, "tag").split()))
+    check("race: tag points at the pushed commit", tag_target(bare, "v0.4.0") == origin_head(bare)
+          == git(repo, "rev-parse", "HEAD").strip())
+    log = read(repo, "CHANGELOG.md")
+    sec = log[log.find("## 0.4.0 ("):log.find("## 0.3.3")]
+    check("race: both changesets batched into the one 0.4.0 section",
+          "(H-9-fix.md)" in sec and "(H-10-feature.md)" in sec and "### Added" in sec and "### Fixed" in sec, sec)
+    check("race: both changesets consumed", changesets(repo) == [], changesets(repo))
+    check("race: no 0.3.4 section in CHANGELOG", "## 0.3.4" not in log)
+    check("race: origin/main has exactly one release commit total", subjects.count("release:") == 1, subjects)
+
+
+def test_publish_failed_push_no_tag(root):
+    repo, bare = make_origin(root, "pub-fail")
+    add_changeset(repo, "H-11", "patch", "will not land.")
+    git(repo, "push", "-q", "origin", "main")
+    hook = os.path.join(bare, "hooks", "pre-receive")
+    write(bare, "hooks/pre-receive", "#!/bin/sh\necho 'origin closed' >&2\nexit 1\n")
+    os.chmod(hook, 0o755)
+    before = origin_head(bare)
+    res = release(repo, "--publish")
+    check("failed push: exit 3", res.returncode == 3, (res.returncode, res.stderr.strip()))
+    check("failed push: no tag created locally", sorted(git(repo, "tag").split()) == ["v0.3.3"], git(repo, "tag").split())
+    check("failed push: no tag on origin, origin/main unchanged",
+          origin_tags(bare) == ["v0.3.3"] and origin_head(bare) == before, origin_tags(bare))
+    check("failed push: error names the push", "push origin HEAD:main failed" in res.stderr, res.stderr)
+    check("failed push: stdout never says tagged", "tagged" not in res.stdout, res.stdout)
+
+
+def test_publish_resume_missing_tag(root):
+    # release commit already on origin, tag missing (a previous run died after the push)
+    repo, bare = make_origin(root, "pub-resume")
+    add_changeset(repo, "H-12", "patch", "resume me.")
+    git(repo, "push", "-q", "origin", "main")
+    res = release(repo, "--publish")
+    git(repo, "tag", "-d", "v0.3.4")
+    git(bare, "tag", "-d", "v0.3.4")
+    res2 = release(repo, "--publish")
+    check("publish resume: exit 0 and tag restored on origin",
+          res.returncode == 0 and res2.returncode == 0 and origin_tags(bare) == ["v0.3.3", "v0.3.4"],
+          (res2.returncode, res2.stderr.strip(), origin_tags(bare)))
+    check("publish resume: no second release commit",
+          git(bare, "log", "--format=%s", "main").count("release:") == 1)
+    check("publish resume: says resuming", "resuming" in res2.stdout, res2.stdout)
+
+
 # ------------------------------------------------------------------ changeset-check.py
 
 def pr(repo, name, mutate):
@@ -362,6 +504,11 @@ def main():
         test_drift(root)
         test_formatting_and_changelog(root)
         test_resume_after_partial_failure(root)
+        test_publish_happy_path(root)
+        test_publish_stale_checkout(root)
+        test_publish_race(root)
+        test_publish_failed_push_no_tag(root)
+        test_publish_resume_missing_tag(root)
         test_guard(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
