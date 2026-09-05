@@ -4,6 +4,12 @@ Newest first. This file is written by `scripts/release.py` from the pending
 `.changeset/*.md` files on every push to main; do not edit it by hand (see
 `.changeset/README.md`).
 
+## 0.3.4 (2026-09-05)
+
+### Fixed
+
+- Documents the release-flow lab note for PR1 (lab RELEASE-FLOW-LAB). (pr1-patch-docs-note.md)
+
 ## 0.3.3 — fail-closed dispatch, draft-then-allocate ids (issues #8, #4)
 - **Fail-closed dispatch read** (lab H-280, kept twice at 5/5 with write-ahead proof; fixes #8): the
   Stop driver no longer grades a failed dispatch read (timeout, nonzero exit, unparseable output) as
