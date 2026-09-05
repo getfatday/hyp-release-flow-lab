@@ -4,6 +4,16 @@ Newest first. This file is written by `scripts/release.py` from the pending
 `.changeset/*.md` files on every push to main; do not edit it by hand (see
 `.changeset/README.md`).
 
+## 0.4.0 (2026-09-05)
+
+### Added
+
+- Adds the release-flow lab capability note for PR2 (lab RELEASE-FLOW-LAB). (pr2-minor-lab-capability.md)
+
+### Fixed
+
+- Fixes the release-flow lab note for PR3 (lab RELEASE-FLOW-LAB). (pr3-patch-lab-fix.md)
+
 ## 0.3.4 (2026-09-05)
 
 ### Fixed
